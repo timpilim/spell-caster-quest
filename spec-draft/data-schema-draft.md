@@ -1,633 +1,678 @@
-# Data Schema Draft — Spell Caster Quest
+# Data Schema — Spell Caster Quest
 
-> **Status:** Draft / proposal (not final).
+> **Status:** Draft v2.0, aligned with `SpellCastGame v2.0.md`. Section references (§) point to that document.
 >
-> This document proposes a **lean, data-driven schema** for Spell Caster Quest.
-> It is meant to serve as a shared “backbone” for development and content authoring.
-> Field names and shapes may change during implementation.
+> **Scope:** content/config entities, save state, and the battle runtime state the engine needs. **Out of scope:** UI component props, animation data, internal React state.
 >
-> **Scope:** content/config entities + minimal runtime/save state entities.
-> **Out of scope:** UI component props, rendering/animation details, internal engine data structures.
+> **Form:** TypeScript-first. These types are meant to live verbatim in `packages/shared` (see GDD §11) and to be enforced on JSON content with zod (or JSON Schema generated from them). A relational mapping for a future backend is sketched in §14.
 
-## 1) High-level data model
-The game is intended to be **configured via JSON** and loaded through async “services” (LocalStorage + local files in MVP; swappable later).
+## 1) Overview
 
-Suggested content files (not mandatory):
-- `content/chapters.json` — chapters + encounter ordering
-- `content/encounters.json` — encounter definitions (single-enemy in MVP)
-- `content/actors.json` — enemy actors + dialogue + movesets
-- `content/fragments.json` — all fragments (Command / Aspect / Entity)
-- `content/fragment-pools.json` — global pool + optional overrides for chapters/encounters
-- `content/buffs.json` — buffs and debuffs (same schema)
-- `content/dictionary.json` (or `dictionary.txt`) — valid English words for binding validation
-- `content/game-config.json` — small global knobs (timer, backfire defaults, etc.)
+The game is **data-driven**: chapters, encounters, enemies, fragments, statuses (buffs/debuffs/Oaths) and rules are JSON, loaded through async services (static files + Local Storage in the MVP; swappable later).
 
-## 2) Naming and conventions
-- `code` fields are stable string identifiers used for referencing, e.g. `"fireball"` or `"goblin_warrior"`.
-- All numeric tuning values are **design knobs**, not hard guarantees.
-- Percentages are represented as decimals (e.g., `0.1` for 10%).
-- Multipliers are represented as decimals (e.g., `1.2` for ×1.2).
+Suggested content layout (`apps/web/public/content/` or a `content/` package):
 
----
+| File | Contains | Schema |
+|------|----------|--------|
+| `game-config.json` | global knobs | `GameConfig` |
+| `chapters.json` | chapters with rules and encounter order | `ChapterDefinition[]` |
+| `encounters.json` | one battle each | `EncounterDefinition[]` |
+| `enemies.json` | enemy actors: stats, moves, dialogue, loot | `EnemyDefinition[]` |
+| `fragments.json` | all fragments incl. Shrouded variants | `FragmentDefinition[]` |
+| `fragment-tables.json` | draw tables: global + chapter/encounter overrides | `FragmentTable[]` |
+| `statuses.json` | buffs (family × level), Oaths, temporary buffs, debuffs | `StatusDefinition[]` |
+| `loot-tables.json` | loot tables referenced by enemies + global fallback | `LootTable[]` |
+| `hints.json` | first-time hint texts | `HintDefinition[]` |
+| `dictionary.txt.gz` | validation word list | see §10 |
 
-## 3) Shared primitive types
+Cross-references are always by **code** (string). A content linter (§13) verifies every reference resolves.
+
+## 2) Conventions
+
+- `code`: stable, lowercase, snake_case, unique **within its entity type** (`fireball`, `power_3`, `oath_flame`, `ch1_toad_king`).
+- Percentages are **fractions** (`0.2` = 20%). Multipliers are decimals (`1.5` = ×1.5). HP, Energy, seconds, turns are integers.
+- Text shown to the player lives in `label`/`description`/dialogue fields (English only in the MVP; a string-table indirection can be added later).
+- Every numeric value is a **tuning knob**; nothing here is a hard promise.
+- Optional fields are omitted, never `null`.
+
+## 3) Primitives
 
 ```ts
-/** Stable code used to reference content across JSON files. */
+/** Stable identifier used to reference content across files. */
 export type Code = string;
 
-/** 0..1 fraction. Example: 0.15 == 15%. */
+/** 0..1 fraction (0.15 = 15%). May exceed 1 where documented (e.g. summed Power bonuses). */
 export type Fraction = number;
 
-/** Multipliers like 1.1 (x1.1). */
+/** Multiplier such as 1.5 (×1.5). */
 export type Multiplier = number;
 
-/** Whole-number counters (HP, turns, etc.). */
+/** Whole number (HP, Energy, turns, seconds). */
 export type Int = number;
 
-/** Milliseconds since epoch (for saves). */
+/** Milliseconds since epoch. */
 export type UnixMs = number;
 
-/**
- * Weighted choice helper.
- * If weight is omitted, treat as weight=1.
- */
-export interface WeightedRef<T> {
+/** Single uppercase letter A–Z. */
+export type Letter = string;
+
+/** Weighted reference; omitted weight means 1. */
+export interface Weighted<T extends Code = Code> {
   code: T;
   weight?: number;
 }
-```
 
----
+/** Primary effect types produced by spells (GDD §4.2.3). */
+export type EffectType = "attack" | "block" | "heal";
+```
 
 ## 4) Global configuration
 
 ```ts
 /**
- * Global tuning knobs.
- * Keep this small; most balancing should live in content (fragments/buffs/actors).
+ * Global rules that are not per-chapter. Keep small: chapter-level knobs live in ChapterRules.
+ * Defaults in comments are the GDD v2.0 values.
  */
 export interface GameConfig {
-  /** Default binding timer in seconds (MVP: 30). */
-  bindingTimeLimitSec: Int;
+  /** Player starting Max HP. Default 100. */
+  playerMaxHp: Int;
 
-  /**
-   * Backfire base damage formula (tunable).
-   * Engine may interpret this as: backfire = maxHp * basePerFragment * fragmentsUsed,
-   * then apply modifiers from buffs.
-   */
+  /** Backfire rule (GDD §4.4.5, D4). */
   backfire: {
-    /** e.g. 0.05 means 5% of Max HP per fragment used. */
-    baseMaxHpFractionPerFragment: Fraction;
-    /** Minimum damage so Backfire always matters. */
+    /** Fraction of Max HP per fragment in the failed spell. Default 0.03. */
+    maxHpFractionPerFragment: Fraction;
+    /** Floor for Backfire damage. Default 1. */
     minDamage: Int;
   };
 
-  /** Default fragment pool size at the start of a player turn (e.g., 7–10). */
-  fragmentPoolSize: Int;
-
-  /** Player starting stats. */
-  player: {
-    /** Starting max HP for the player (e.g., 100). */
-    startingMaxHp: Int;
+  /** Binding timer rule (GDD §4.4.1, D9). */
+  bindingTimer: {
+    /** Base seconds for spells up to `baseCoversFragments`. Default 30. */
+    baseSec: Int;
+    /** Fragment count covered by baseSec. Default 4. */
+    baseCoversFragments: Int;
+    /** Extra seconds per fragment above baseCoversFragments. Default 10. */
+    extraSecPerFragment: Int;
+    /** Hard floor after debuffs/Oaths. Default 10. */
+    minSec: Int;
   };
+
+  /** Minimum fragments in any spell (Command + 1 Aspect + Entity). Default 3. */
+  minFragmentsPerSpell: Int;
+
+  /** Maximum Oathbound statuses the player may hold. Default 2. */
+  maxOaths: Int;
+
+  /** Loot screen option count. Default 3. */
+  lootOptions: Int;
+
+  /** Summed Armor reduction cap (GDD §6.5). Default 0.75. */
+  maxDamageReduction: Fraction;
+
+  /** Global fallback loot table used when an enemy table has too few valid options (GDD §6.4). */
+  fallbackLootTableCode: Code;
+
+  /** Word list to validate binding words against (§10). */
+  dictionaryCode: Code;
+
+  /** Max reroll attempts when enforcing pool solvability (GDD §7.2). Default 20. */
+  poolSolvabilityAttempts: Int;
 }
 ```
 
----
-
-## 5) Campaign structure: chapters and encounters
+## 5) Chapters and encounters
 
 ```ts
 /**
- * A chapter is the player-facing “map” list.
- * Encounters are infinitely replayable; “beaten” is tracked in save state.
+ * Per-chapter difficulty levers (GDD §5.3). Encounters may override individual fields.
  */
-export interface Chapter {
-  code: Code;
-  name: string;
+export interface ChapterRules {
+  /** Max fragments per spell: 3 / 4 / 5 in the MVP chapters. */
+  maxFragmentsPerSpell: Int;
 
-  /** Ordered list shown on the Chapter screen. */
+  /** Pool capacity per category (GDD §7.1). */
+  poolSize: { commands: Int; aspects: Int; entities: Int };
+
+  /** Probability that a Command or Aspect draw is taken from Shrouded entries. 0 / 0.2 / 0.35. */
+  shroudedShare: Fraction;
+
+  /** Fragment table used for draws unless the encounter overrides it. */
+  fragmentTableCode: Code;
+
+  /** Temporary buffs a `?` Aspect can grant in this chapter (GDD §6.6). */
+  tempBuffPool: Weighted[];
+}
+
+/**
+ * A chapter: the player-facing encounter list plus its rules.
+ */
+export interface ChapterDefinition {
+  code: Code;
+  /** Location name shown as the chapter title. */
+  title: string;
+  /** Intro plot text (shown once as a modal, then truncated at the top of the list). */
+  intro: string;
+  /** Chapter unlocked after this one's boss is beaten; omitted for the last chapter. */
+  nextChapterCode?: Code;
+  rules: ChapterRules;
+  /** Ordered encounter codes as shown in the list; the boss is `bossEncounterCode` and is rendered separately. */
   encounterCodes: Code[];
-
-  /** Encounter that gates progression (must be beaten once to unlock next chapter). */
   bossEncounterCode: Code;
-
-  /** Optional fragment pool override for the chapter (useful for tutorials). */
-  fragmentPoolCode?: Code;
-
-  /** Optional flavor text. */
-  description?: string;
 }
 
 /**
- * One selectable battle on the chapter list.
- * MVP assumption: exactly one hostile actor.
+ * One selectable battle. MVP: exactly one enemy.
  */
-export interface Encounter {
+export interface EncounterDefinition {
   code: Code;
-  name: string;
-
-  /** Enemy actor encountered. */
-  actorCode: Code;
-
-  /** Optional pool override for this encounter (tutorial fight, theme fights). */
-  fragmentPoolCode?: Code;
-
-  /** Optional difficulty hint shown in the UI (★, numeric, or text). */
-  difficultyHint?: string;
+  enemyCode: Code;
+  /** One-line flavor text on the encounter row. */
+  flavor?: string;
+  /** Overrides of the chapter rules for this fight (tutorial pools, themed fights). */
+  rulesOverride?: Partial<ChapterRules>;
+  /** Hints to show the first time this encounter is played (tutorial). */
+  hintCodes?: Code[];
 }
 ```
 
----
-
-## 6) Actors and moves
+## 6) Fragments and fragment tables
 
 ```ts
-/**
- * Dialogue lines used by UI at battle lifecycle moments.
- * Arrays enable simple random selection.
- */
-export interface ActorDialogue {
-  greeting?: string[];
-  onLose?: string[]; // enemy wins, player loses
-  onWin?: string[];  // player wins, enemy loses
-}
-
-/** MVP move types: enemies can attack or apply a debuff to the player. */
-export type MoveType = "attack" | "debuff_player";
-
-/**
- * Enemy move.
- * Enemy intent is derived from this (intentLabel + numbers/effects).
- */
-export interface ActorMove {
-  code: Code;
-  type: MoveType;
-
-  /** Short line shown as “intent” (e.g., "raises a dagger"). */
-  intentLabel: string;
-
-  /** For attacks: base damage. */
-  value?: Int;
-
-  /** For debuffs: buff/debuff code applied to the player. */
-  appliesBuffCode?: Code;
-
-  /** Optional weight for random choice within the moveset. */
-  weight?: number;
-}
-
-/**
- * An actor is any combatant.
- * In MVP, only hostile actors are configured here (enemies).
- */
-export interface Actor {
-  code: Code;
-  hostile: boolean; // MVP: true
-
-  name: string;
-  maxHp: Int;
-
-  /** Optional, can start as emoji then later become asset codes/URLs. */
-  avatar?: string;
-
-  /** Randomly choose a move from this list each enemy turn (weighted). */
-  moveList: ActorMove[];
-
-  /**
-   * Loot pool: buff codes that this actor can offer after defeat.
-   * On victory, the game picks N options (e.g., 3) and the player chooses 1.
-   */
-  buffPool: WeightedRef<Code>[];
-
-  dialogue?: ActorDialogue;
-}
-```
-
----
-
-## 7) Fragments and fragment pools
-Fragments are the “chips” used to build spells.
-
-**Key design points implemented in schema:**
-- **No runes.** Binding is built by selecting **one letter per fragment**.
-- **Shrouded fragments** hide many letters in drafting mode and reveal on selection in binding mode.
-- Aspects can carry a `?` marker that grants temporary buffs on cast.
-
-```ts
-/** Fragment categories used by the sentence syntax. */
 export type FragmentCategory = "command" | "aspect" | "entity";
 
-/** Primary effect types for Entities. */
-export type EntityEffectType = "attack" | "block" | "heal";
-
 /**
- * A single fragment.
- * The engine can treat fragments as immutable templates.
+ * Fields shared by all fragment categories.
  */
 export interface FragmentBase {
   code: Code;
-
-  /** The underlying English word (always stored fully). */
-  word: string;
-
-  /** Mask string for shrouded fragments. '?' indicates hidden letters, '.' indicates visible letters (e.g., "??..?.?"). */
-  shroudMask: string;
-
   category: FragmentCategory;
-
-  /** Optional tags for content tooling and balance queries. */
+  /** The full word, uppercase A–Z only, 4–9 letters. */
+  word: string;
+  /**
+   * Shroud mask for Shrouded fragments (GDD §4.4.4). Same length as `word`;
+   * `_` = hidden, `.` = visible (e.g. "S_V___"). Omitted for normal fragments.
+   * Shrouded variants are separate entries with their own code and stats.
+   */
+  shroudMask?: string;
+  /** Free-form tags for tooling (e.g. "tutorial", "fire"). */
   tags?: string[];
 }
 
-/**
- * Command (Verb): defines the spell’s base energy E.
- */
+/** Command (verb): sets base Energy (GDD §4.2.1). */
 export interface CommandFragment extends FragmentBase {
   category: "command";
-
-  /** Base energy generated by the command. */
   baseEnergy: Int;
 }
 
-/**
- * Aspect (Adjective): modifies energy and/or adds secondary numeric effects.
- *
- * MVP rules:
- * - Can apply an additive (+k) and/or multiplicative (×m) modifier to energy.
- * - Can also add one secondary numeric effect (attack/block/heal).
- * - Can optionally grant mystery temporary buffs via `tempBuffOnCast`.
- */
-export interface AspectFragment extends FragmentBase {
-  category: "aspect";
-
-  energyMod?: {
-    /** Additive change to energy (e.g., +1). */
-    add?: Int;
-    /** Multiplicative change to energy (e.g., ×1.5). */
-    multiply?: Multiplier;
-  };
-
-  /** Optional secondary effect that applies in addition to the Entity primary effect. */
-  secondaryEffect?: {
-    type: EntityEffectType;
-    value: Int;
-  };
-
-  /**
-   * If set, this Aspect carries the “?” marker and grants temporary buffs when the spell is cast.
-   * One random buff is granted per marker.
-   */
-  tempBuffOnCast?: {
-    /** Number of random temporary buffs granted when included in a successfully cast spell. */
-    count: Int;
-
-    /** Pool to draw temporary buffs from. Uses buff codes (defined in buffs.json). */
-    pool: WeightedRef<Code>[];
-  };
+/** A flat secondary effect carried by an Aspect (GDD §4.2.2). Not scaled by Power. */
+export interface SecondaryEffect {
+  type: EffectType;
+  value: Int;
 }
 
-/**
- * Entity (Noun): converts the final energy into the primary effect type.
- */
+/** Aspect (adjective): modifies Energy, may add a secondary effect and/or a `?` marker. */
+export interface AspectFragment extends FragmentBase {
+  category: "aspect";
+  /** Additive Energy change (+1, +2, +3). */
+  energyAdd?: Int;
+  /** Multiplicative Energy change (1.5, 2). */
+  energyMultiply?: Multiplier;
+  secondary?: SecondaryEffect;
+  /** Number of `?` markers (temporary buffs granted on cast). Usually 1. */
+  mysteryMarkers?: Int;
+}
+
+/** Entity (noun): converts Energy into the primary effect 1:1 (GDD §4.2.3). */
 export interface EntityFragment extends FragmentBase {
   category: "entity";
-
-  effectType: EntityEffectType;
-
-  /** Optional flat bonus to the converted effect (rare; keep readable). */
+  effectType: EffectType;
+  /** Rare flat bonus added to the primary effect (e.g. STORM +1). */
   flatBonus?: Int;
 }
 
-export type Fragment = CommandFragment | AspectFragment | EntityFragment;
+export type FragmentDefinition = CommandFragment | AspectFragment | EntityFragment;
 
 /**
- * Fragment pool definition.
- * A pool can be global or scoped to a chapter/encounter.
+ * A draw table for pool refills (GDD §7.1). The chapter names its table; encounters may override.
+ * Shrouded entries are listed separately so `ChapterRules.shroudedShare` can select between the two lists.
  */
-export interface FragmentPool {
+export interface FragmentTable {
   code: Code;
   label?: string;
-
-  /**
-   * The set of fragments available to be rolled into the player pool.
-   * Use weights to influence frequency.
-   */
-  fragments: WeightedRef<Code>[];
-
-  /** Optional pool size override (otherwise use GameConfig.fragmentPoolSize). */
-  poolSizeOverride?: Int;
+  /** Normal fragments, all categories, with draw weights. */
+  entries: Weighted[];
+  /** Shrouded fragments (must have `shroudMask`). May be empty in early chapters. */
+  shroudedEntries: Weighted[];
 }
 ```
 
----
+## 7) Statuses: buffs, Oaths, temporary buffs, debuffs
 
-## 8) Buffs and debuffs (Modifier pattern)
-Buffs and debuffs share the same definition. A debuff is simply a `GameBuff` with `isDebuff: true`.
+One definition type covers every passive effect on the player. The `kind` decides ownership rules (GDD §6):
 
-This section is based on the earlier “modifier pattern” draft in the chat PDF, updated for the newer binding mechanics (no runes; binding timer; shrouded behavior).
+- `buff`: permanent loot; one per `family`, higher `level` replaces lower.
+- `oath`: permanent loot; at most `GameConfig.maxOaths`; always has at least one negative effect.
+- `temp_buff`: battle-only, granted by `?` Aspects; duplicates stack.
+- `debuff`: battle-only, applied by enemies, turn-limited; re-application refreshes duration.
+
+### 7.1 Effects
+
+Effects are a closed union rather than a generic "target/operator" pair, so the engine, the linter and the UI tooltip generator all know exactly what can exist. Add a member when a new mechanic is designed.
 
 ```ts
-/**
- * Stats/rules the engine can modify.
- * Keep this list minimal and expand only when needed.
- */
-export type TargetStat =
-  // Combat
-  | "damage_outgoing"          // multiplier or additive bonus
-  | "damage_incoming"          // multiplier (damage reduction)
-  | "max_hp"                   // add or multiply max HP
-  | "lifesteal"                // additive fraction of damage healed
-  | "backfire_damage_multiplier" // multiply computed backfire damage
+/** Gate for conditional effects (GDD §6.2). */
+export type StatusCondition =
+  /** Rage, Shell: HP ≤ fraction of Max HP. */
+  | { type: "hp_at_most"; fraction: Fraction }
+  /** Payback: the player took damage (attack, Bleed or Backfire) during the previous round. */
+  | { type: "damaged_last_round" };
 
-  // Drafting / binding rules
-  | "binding_time_limit_sec"   // override or add seconds
-  | "max_fragments_per_spell"  // cap spell size (early progression lever)
-  | "binding_banned_char"      // restriction: binding word cannot contain this letter
+/** Multiplies the effect value by a runtime counter (GDD §6.2). */
+export type StatusScaling =
+  /** Momentum: consecutive successful casts, reset by Backfire. */
+  | { by: "consecutive_casts"; maxStacks: Int }
+  /** Confidence: fragments in the current spell beyond `beyond`. */
+  | { by: "fragments_beyond"; beyond: Int };
 
-  // Enemy flow (future-facing but already discussed)
-  | "enemy_skip_turn_chance"   // additive probability
-  | "chips_per_turn";          // pool size modifier
+export type StatusEffect =
+  /** Summed into the Energy multiplier: E × (1 + Σ). Power, Rage, Payback, Momentum, Confidence, Surge, Oaths. */
+  | { type: "energy_pct"; value: Fraction; condition?: StatusCondition; scaling?: StatusScaling }
+  /** Vitality, Vigor. Applied at battle start (and heals the same amount when gained mid-battle). */
+  | { type: "max_hp_add"; value: Int }
+  /** Armor, Ward. Summed, capped by GameConfig.maxDamageReduction. Enemy attacks only. */
+  | { type: "damage_taken_reduction"; value: Fraction }
+  /** Lifesteal, Thirst, Oath of Glass: heal fraction of Attack damage dealt (floor). Summed. */
+  | { type: "lifesteal"; value: Fraction }
+  /** Resolve (0.75, 0.5, 0.25), Oath of Glass (2), Oath of Depth (1.5). Multiplied together. */
+  | { type: "backfire_multiplier"; value: Multiplier }
+  /** Focus, Clarity (+), Haste, Oath of Pressure (−). Summed, then floored at GameConfig.bindingTimer.minSec. */
+  | { type: "binding_time_add_sec"; value: Int }
+  /** Oath of Depth: +1 to the chapter's maxFragmentsPerSpell. */
+  | { type: "max_fragments_add"; value: Int }
+  /** Oath of Flame (fixed letter) and Hex (random consonant chosen when applied, stored on the instance). */
+  | { type: "banned_letter"; letter: Letter | "random_consonant" }
+  /** Shell: gain Block at the end of the player's turn. */
+  | { type: "block_at_turn_end"; value: Int; condition?: StatusCondition }
+  /** Bleed: HP change at the start of the player's turn (negative = damage; ignores Armor and Block). */
+  | { type: "hp_at_turn_start"; value: Int }
+  /** Frailty: multiply Block gained (0.5). */
+  | { type: "block_multiplier"; value: Multiplier }
+  /** Oath of Silence: multiply Aspect secondary effects. */
+  | { type: "secondary_multiplier"; value: Multiplier }
+  /** Oath of Silence: add to every Command's base Energy (negative allowed). */
+  | { type: "command_energy_add"; value: Int }
+  /** Fog: when applied, shroud N random normal pool fragments until they are used. */
+  | { type: "shroud_pool_fragments"; count: Int };
+```
 
-/**
- * Optional scaling sources used for reactive/conditional buffs.
- */
-export type ScalingSource =
-  | "constant"
-  | "hp_lost_percent"
-  | "dmg_taken_prev"
-  | "dmg_dealt_prev"
-  | "fragments_in_spell";
+### 7.2 Definitions
 
-/**
- * A simple condition gate for a modifier.
- * Extend as needed.
- */
-export type BuffCondition =
-  | { type: "hp_below_percent"; value: Fraction }
-  | { type: "turn_count_gte"; value: Int };
+```ts
+export type StatusKind = "buff" | "oath" | "temp_buff" | "debuff";
 
-/**
- * A modifier describes one atomic rule change.
- */
-export interface Modifier {
-  target: TargetStat;
-
-  /** How to apply the value to the target. */
-  operator: "add" | "multiply" | "append" | "override";
-
-  /**
-   * Base value for the operation.
-   * - numbers for most stats
-   * - strings for list-like restrictions (e.g., banned char)
-   */
-  baseValue: number | string;
-
-  /** Optional scaling, enabling Payback/Momentum/Scale families. */
-  scaling?: {
-    source: ScalingSource;
-    factor: number;
-  };
-
-  /** Optional condition gate. */
-  condition?: BuffCondition;
-}
+/** Buff families (GDD §6.2). Also used for icons and loot filtering. */
+export type BuffFamily =
+  | "power" | "vitality" | "armor" | "lifesteal" | "resolve" | "focus"
+  | "rage" | "shell" | "payback" | "momentum" | "confidence";
 
 /**
- * Buff definition (also used for debuffs).
- * Buffs are mostly permanent when earned as loot; debuffs are typically temporary.
+ * A buff, Oath, temporary buff or debuff.
  */
-export interface GameBuff {
+export interface StatusDefinition {
   code: Code;
-
-  /** Display label for UI pills and reward choices. */
+  kind: StatusKind;
+  /** Display name, e.g. "Power III", "Oath of Flame", "Bleed". */
   label: string;
+  /** One-line effect text for chips and loot cards, e.g. "+30% Energy". */
+  summary: string;
+  /** Longer tooltip text. Optional; can be generated from effects. */
+  description?: string;
+  /** Emoji placeholder now, icon code later. */
+  icon: string;
 
-  /** If true, this is displayed as a debuff (red) and is expected to be temporary. */
-  isDebuff?: boolean;
+  /** Required for kind = "buff": family + level drive the one-per-family cap (GDD §6.4). */
+  family?: BuffFamily;
+  /** 1..5. Required for kind = "buff". */
+  level?: Int;
 
-  /**
-   * Tier clarifies “build-defining with restriction” vs normal.
-   * This replaces a rarity ladder in MVP.
-   */
-  tier?: "standard" | "oathbound";
+  /** Required for kind = "debuff": turns it stays active (GDD §6.7). Omitted = until battle end. */
+  durationTurns?: Int;
 
-  /** Optional quick family tag for tooling/balance. */
-  family?:
-    | "power"
-    | "armor"
-    | "vitality"
-    | "lifesteal"
-    | "payback"
-    | "rage"
-    | "momentum"
-    | "power_scale"
-    | "oathbound";
-
-  /**
-   * Default duration hint.
-   * - Loot buffs: usually permanent (omit)
-   * - Debuffs: typically battle or N turns
-   */
-  defaultDuration?:
-    | { kind: "battle" }
-    | { kind: "turns"; turns: Int };
-
-  /** The actual logic of the buff. */
-  modifiers: Modifier[];
+  effects: StatusEffect[];
 }
 ```
 
-### Example: Oathbound restriction and timer reduction
-```ts
-// Example content entry (buffs.json)
-const oathOfPressure: GameBuff = {
-  code: "oath_pressure",
-  label: "Oath of Pressure",
-  tier: "oathbound",
-  family: "oathbound",
-  modifiers: [
-    { target: "damage_outgoing", operator: "multiply", baseValue: 1.5 },
-    { target: "binding_time_limit_sec", operator: "override", baseValue: 20 }
-  ]
-};
+### 7.3 Examples
+
+```jsonc
+// statuses.json (excerpt)
+[
+  { "code": "power_3", "kind": "buff", "family": "power", "level": 3,
+    "label": "Power III", "summary": "+30% Energy", "icon": "🔥",
+    "effects": [{ "type": "energy_pct", "value": 0.3 }] },
+
+  { "code": "rage_2", "kind": "buff", "family": "rage", "level": 2,
+    "label": "Rage II", "summary": "+25% Energy while HP ≤ 50%", "icon": "😤",
+    "effects": [{ "type": "energy_pct", "value": 0.25, "condition": { "type": "hp_at_most", "fraction": 0.5 } }] },
+
+  { "code": "momentum_1", "kind": "buff", "family": "momentum", "level": 1,
+    "label": "Momentum I", "summary": "+5% Energy per consecutive cast (max 5)", "icon": "🌀",
+    "effects": [{ "type": "energy_pct", "value": 0.05, "scaling": { "by": "consecutive_casts", "maxStacks": 5 } }] },
+
+  { "code": "oath_flame", "kind": "oath", "label": "Oath of Flame",
+    "summary": "+50% Energy · no letter L in binding words", "icon": "🕯️",
+    "effects": [{ "type": "energy_pct", "value": 0.5 }, { "type": "banned_letter", "letter": "L" }] },
+
+  { "code": "tmp_surge", "kind": "temp_buff", "label": "Surge", "summary": "+20% Energy this battle", "icon": "⚡",
+    "effects": [{ "type": "energy_pct", "value": 0.2 }] },
+
+  { "code": "bleed", "kind": "debuff", "durationTurns": 3, "label": "Bleed", "summary": "−3 HP at turn start", "icon": "🩸",
+    "effects": [{ "type": "hp_at_turn_start", "value": -3 }] },
+
+  { "code": "hex", "kind": "debuff", "durationTurns": 2, "label": "Hex", "summary": "one letter is banned", "icon": "🔮",
+    "effects": [{ "type": "banned_letter", "letter": "random_consonant" }] }
+]
 ```
 
----
+## 8) Enemies, moves, dialogue, loot
 
-## 9) Dictionary configuration
-The binding word must be validated against a dictionary.
+```ts
+export type EnemyMoveType = "attack" | "debuff";
+
+/**
+ * One enemy action. Intent shows exactly this (GDD §4.3): attacks show `damage`, debuffs show the status icon.
+ */
+export interface EnemyMove {
+  code: Code;
+  type: EnemyMoveType;
+  /** Short intent line, e.g. "sharpens its quill". */
+  intentLabel: string;
+  /** Attack damage before player Armor/Block. Required for type = "attack". */
+  damage?: Int;
+  /** Bosses: telegraphed big hit (💥). Never selected twice in a row. */
+  heavy?: boolean;
+  /** Debuff applied to the player. Required for type = "debuff". */
+  statusCode?: Code;
+  /** Draw weight (default 1). */
+  weight?: number;
+  /** Optional flavor line shown when the move resolves. */
+  quip?: string;
+}
+
+export interface EnemyDialogue {
+  /** Shown before the first player turn. */
+  greeting: string[];
+  /** Enemy loses (player victory). */
+  onDefeat: string[];
+  /** Enemy wins (player defeat). */
+  onVictory: string[];
+}
+
+export type EnemyType = "standard" | "boss";
+
+/**
+ * Enemy actor (GDD §8). The player actor is not content; it comes from GameConfig + save state.
+ */
+export interface EnemyDefinition {
+  code: Code;
+  name: string;
+  type: EnemyType;
+  /** Emoji placeholder now, asset code later. */
+  portrait: string;
+  maxHp: Int;
+  moves: EnemyMove[];
+  dialogue: EnemyDialogue;
+  /** Loot table offered after victory (GDD §5.4). */
+  lootTableCode: Code;
+}
+
+/**
+ * Loot table: weighted status codes (buffs and Oaths). The Loot Screen filters to options that improve
+ * the player (GDD §6.4), draws `GameConfig.lootOptions`, and tops up from the fallback table.
+ */
+export interface LootTable {
+  code: Code;
+  entries: Weighted[];
+  /** Bosses: an Oath choice is always among the options on the first victory. */
+  guaranteedOathOnFirstWin?: boolean;
+}
+```
+
+## 9) Hints
 
 ```ts
 /**
- * Dictionary config describes where/how to load word validation data.
- * The actual word list may be stored as a text file for size/perf.
+ * First-time hints (GDD §9.2). Shown once per save; `trigger` names an engine event.
+ */
+export interface HintDefinition {
+  code: Code;
+  trigger:
+    | "draft_command" | "draft_aspect" | "draft_entity" | "press_bind" | "binding_started"
+    | "first_intent" | "first_shrouded" | "first_mystery" | "first_heavy_intent" | "first_debuff"
+    | "first_oath_offer" | "first_loot";
+  text: string;
+}
+```
+
+## 10) Dictionary
+
+```ts
+/**
+ * Word list for binding validation (GDD §10.1). Ships as gzipped plain text, one lowercase word per line.
+ * Loaded once into a Set plus a per-length index (words grouped by length) for the solvability check.
  */
 export interface DictionaryConfig {
   code: Code;
-
-  /** A human label (“common-20k”, “full-english”, etc.). */
   label?: string;
-
-  /**
-   * Resource path or key for loading.
-   * In MVP this can be a local file path.
-   */
+  /** Asset path or URL. */
   resource: string;
-
-  /** Optional: normalize to lowercase during validation. */
-  caseInsensitive?: boolean;
+  /** Words shorter than this are ignored even if present. Default 3. */
+  minWordLength: Int;
 }
 ```
 
----
+Validation rule: `isValidBindingWord(word) = word.length ≥ minWordLength && dictionary.has(word.toLowerCase()) && !bannedLetters.some(l => word.includes(l))`.
 
-## 10) Save state (persistent player progress)
-This schema is intentionally small. It stores **progress and permanent buffs**, not battle state.
+Solvability check for a spell with letter sets `S₁..Sₙ` (one per fragment): any word `w` of length `n` in the per-length index with `w[i] ∈ Sᵢ` for all `i`, ignoring banned letters.
+
+## 11) Save state
 
 ```ts
 /**
- * Persistent player profile (LocalStorage for MVP).
+ * Persistent player progress (Local Storage in the MVP). No battle state, no HP.
  */
 export interface PlayerSave {
+  /** Schema version for migrations, e.g. "2.0". */
   version: string;
+  createdAt: UnixMs;
   updatedAt: UnixMs;
 
-  /** Chapters unlocked/available to select. */
+  /** Chapters the player may open. */
   unlockedChapterCodes: Code[];
+  /** Last opened chapter, for "Continue". */
+  currentChapterCode: Code;
 
-  /** Encounters beaten at least once (used for “Beaten” markers). */
+  /** Encounters beaten at least once (Beaten marker, boss gate). */
   beatenEncounterCodes: Code[];
-
-  /** Permanent buffs earned from victory rewards. */
-  permanentBuffCodes: Code[];
-
-  /** Optional: which chapter the user last viewed/played. */
-  lastChapterCode?: Code;
-}
-```
-
----
-
-## 11) Battle runtime state (minimal engine-facing shapes)
-These types represent the **runtime** objects used during a battle.
-They are not necessarily stored as JSON content files.
-
-```ts
-/**
- * An instance of an actor in battle.
- * Keeps current HP and currently applied statuses.
- */
-export interface BattleActorState {
-  actorCode: Code;
-  currentHp: Int;
-
-  /** Active buffs/debuffs for this battle instance. */
-  activeBuffs: ActiveBuffInstance[];
-
-  /** Cached intent for UI (computed each enemy turn). */
-  nextIntent?: ActorMove;
-}
-
-/**
- * A buff instance applied in battle.
- * Permanent buffs still appear here for battle calculations, but are sourced from save state.
- */
-export interface ActiveBuffInstance {
-  buffCode: Code;
-
-  /** Remaining turns if this is a temporary effect. */
-  remainingTurns?: Int;
-
-  /** Where it came from (useful for debugging). */
-  source?: "permanent" | "enemy_move" | "aspect_question_mark";
-}
-
-/**
- * The player’s drafting pool for the current turn.
- */
-export interface DraftPoolState {
-  /** Fragment codes currently available to pick. */
-  fragmentCodes: Code[];
-}
-
-/**
- * A spell being built on the Scroll.
- * Ordering matters for both energy math and binding segments.
- */
-export interface SpellDraft {
-  /** Fragment codes in scroll order. */
-  fragmentCodes: Code[];
-}
-
-/**
- * Binding mode state: one segment per fragment.
- * Each segment stores the selected letter index for that fragment.
- */
-export interface BindingModeState {
-  /** Spell being bound (frozen at binding mode entry). */
-  spell: SpellDraft;
-
-  /** Timer remaining (seconds). */
-  timeRemainingSec: Int;
+  /** Encounters played at least once (for tutorial hints and first-win Oath guarantees). */
+  playedEncounterCodes: Code[];
 
   /**
-   * Per-fragment selection.
-   * selectedIndex is an index into the fragment.word.
+   * Held permanent statuses (kind "buff" or "oath"), at most one per family and at most
+   * GameConfig.maxOaths Oaths. Levels are never lost (GDD §6.4).
    */
-  selections: Array<{
-    fragmentCode: Code;
+  heldStatusCodes: Code[];
 
-    /** Selected character index for this fragment, or undefined if not chosen yet. */
-    selectedIndex?: Int;
+  /** Hint codes already shown. */
+  shownHintCodes: Code[];
 
-    /** Which hidden indices have been revealed (for shrouded fragments). */
-    revealedHiddenIndices?: Int[];
-  }>;
-}
-
-/**
- * Full battle state snapshot.
- */
-export interface BattleState {
-  battleCode: Code;
-
-  encounterCode: Code;
-
-  /** Player and enemy states. */
-  player: BattleActorState;
-  enemy: BattleActorState;
-
-  /** Current draft pool and scroll. */
-  pool: DraftPoolState;
-  scroll: SpellDraft;
-
-  /** Present only while binding. */
-  binding?: BindingModeState;
-
-  /** Turn counter, starting at 1. */
-  turn: Int;
-
-  /** Who acts next. */
-  phase: "player_draft" | "player_binding" | "enemy" | "resolved";
+  /** Lightweight stats for the future (not shown in MVP). */
+  stats?: {
+    battlesWon: Int;
+    battlesLost: Int;
+    spellsCast: Int;
+    backfires: Int;
+    longestBindingWord?: string;
+  };
 }
 ```
 
----
+## 12) Battle runtime state
 
-## 12) Notes for implementers
-- **Fragment masks are deterministic** using `ShroudSpec.hiddenIndices`. This keeps puzzles consistent and testable.
-- **Invalid binding words do not cause Backfire.** Only timer expiry or Give Up triggers Backfire.
-- Consider implementing content validation tooling early:
-  - detect missing codes
-  - ensure fragment pools can satisfy `draftingGuarantees`
-  - ensure buffs referenced by actors and aspects exist
+Engine-facing shapes. Serializable, so a battle can be resumed after a reload and replayed in tests. All randomness comes from `rngState`.
 
----
+```ts
+export type BattlePhase =
+  | "enemy_greeting"
+  | "player_draft"
+  | "player_bind"
+  | "resolve_cast"
+  | "resolve_backfire"
+  | "resolve_fizzle"
+  | "enemy_act"
+  | "victory"
+  | "defeat";
 
-## Appendix: quick mapping from older schema to updated mechanics
-- “Rune”/`runeIndex` → **removed** (binding is letter-selection by segment).
-- `seal_banned_char` → `binding_banned_char`.
-- “Mystery fragments” → `shroud` + “?” buttons reveal letters in Binding Mode.
-- Typed sealing input → removed; dictionary validation happens after all segments are filled.
+/**
+ * A status applied in this battle (permanent ones are copied in at battle start).
+ */
+export interface StatusInstance {
+  /** Unique within the battle; lets the same temp buff stack twice. */
+  instanceId: string;
+  statusCode: Code;
+  source: "permanent" | "mystery" | "enemy";
+  /** Turns left for debuffs; omitted = until battle end. */
+  remainingTurns?: Int;
+  /** Resolved at application time for `banned_letter: "random_consonant"`. */
+  bannedLetter?: Letter;
+}
+
+/**
+ * A fragment sitting in the pool. Instance-level because Fog can shroud a normal fragment at runtime.
+ */
+export interface PoolFragment {
+  instanceId: string;
+  fragmentCode: Code;
+  /** True if the chip currently shows a mask (Shrouded definition, or Fogged). */
+  shrouded: boolean;
+  /** Mask in effect when shrouded (definition mask, or a generated one for Fog). */
+  shroudMask?: string;
+}
+
+/** The spell on the desk, in sentence order: [command, ...aspects, entity]. */
+export interface SpellDraft {
+  fragmentInstanceIds: string[];
+}
+
+/**
+ * Binding Mode state (GDD §4.4). One segment per fragment.
+ */
+export interface BindingState {
+  /** Frozen at Bind time. */
+  spell: SpellDraft;
+  /** Selected letter index into fragment.word per segment; -1 = empty. */
+  selectedLetterIndex: Int[];
+  /** Wall-clock deadline; remaining time is derived, so pausing/resuming is a UI concern. */
+  deadlineAt: UnixMs;
+  /** Total seconds granted (for the timer ring). */
+  totalSec: Int;
+  /** Letters rejected by Hex/Oath, for the "blocked" feedback. */
+  bannedLetters: Letter[];
+  /** Number of invalid words tried (analytics, hints). */
+  invalidAttempts: Int;
+}
+
+/**
+ * Computed outcome of a cast, shown on the spell card and applied in resolve_cast.
+ */
+export interface CastResult {
+  fragmentCodes: Code[];
+  bindingWord: string;
+  energy: Int;
+  primary: { type: EffectType; value: Int };
+  secondary: SecondaryEffect[];
+  /** Temp buffs granted by `?` markers. */
+  grantedStatusCodes: Code[];
+  /** HP healed by Lifesteal. */
+  lifestealHeal: Int;
+}
+
+export interface PlayerBattleState {
+  hp: Int;
+  maxHp: Int;
+  /** Block active until the start of the next player turn. */
+  block: Int;
+  statuses: StatusInstance[];
+  /** Momentum counter; reset by Backfire. */
+  consecutiveCasts: Int;
+  /** Payback flag: damage taken during the previous round. */
+  damagedLastRound: boolean;
+}
+
+export interface EnemyBattleState {
+  enemyCode: Code;
+  hp: Int;
+  /** Move the enemy will perform this round (Intent). */
+  intentMoveCode: Code;
+  /** For the "no heavy twice in a row" rule. */
+  lastMoveCode?: Code;
+}
+
+/**
+ * Full battle snapshot.
+ */
+export interface BattleState {
+  battleId: string;
+  encounterCode: Code;
+  /** Effective rules = chapter rules + encounter override + Oath of Depth. */
+  rules: ChapterRules;
+  /** Serializable PRNG state (e.g. xorshift seed) for deterministic replays. */
+  rngState: string;
+  /** 1-based round counter. */
+  round: Int;
+  phase: BattlePhase;
+  player: PlayerBattleState;
+  enemy: EnemyBattleState;
+  pool: PoolFragment[];
+  draft: SpellDraft;
+  /** Present only in phase player_bind. */
+  binding?: BindingState;
+  /** Present in resolve_cast / resolve_backfire. */
+  lastCast?: CastResult;
+  lastBackfireDamage?: Int;
+  /** Center-panel narration line for the current phase. */
+  narration?: string;
+}
+```
+
+## 13) Content validation (linter rules)
+
+Run at build time and in unit tests:
+
+1. Every `Code` reference resolves (`enemyCode`, `statusCode`, `lootTableCode`, `fragmentTableCode`, table entries, `tempBuffPool`, `nextChapterCode`, `bossEncounterCode` ∈ chapter encounters or listed separately).
+2. Fragments: `word` matches `^[A-Z]{4,9}$`; Commands and Entities contain ≥ 2 distinct vowels (GDD §7.4); `shroudMask` has the word's length, uses only `_`/`.`, and hides 60–80% of letters; Shrouded entries appear only in `shroudedEntries`.
+3. Fragment tables referenced by a chapter contain at least `poolSize.x + 1` distinct fragments per category so refills never stall.
+4. Pool solvability sanity: for each chapter table, sample 1,000 random pools and report the share needing rerolls (target < 5%).
+5. Statuses: `kind = buff` has `family` and `level`; levels within a family are contiguous from 1 and effect values are monotonic; `kind = oath` has at least one negative effect; `kind = debuff` has `durationTurns` (or is Fog); `banned_letter` letters are consonants.
+6. Enemies: attack moves have `damage`, debuff moves have a `statusCode` of kind `debuff`, at most one `heavy` move per enemy, weights > 0.
+7. Loot tables reference only `buff`/`oath` statuses; boss tables contain at least one Oath when `guaranteedOathOnFirstWin`.
+8. `hints.json` covers every trigger used by chapter 1 encounters.
+
+## 14) Future backend mapping (not MVP)
+
+When cloud saves arrive on the Fastify + Postgres backend from the template:
+
+- Content stays as versioned JSON assets (or a `content_bundle(version, json)` table); it is not normalized into tables.
+- `PlayerSave` maps to `player_save(user_id PK, version, json JSONB, updated_at)`. One row per user is enough; conflict resolution by `updatedAt`.
+- Optional analytics: `battle_result(user_id, encounter_code, won, rounds, backfires, longest_word, played_at)`.
+
+## Appendix: changes from the previous draft
+
+- `GameConfig`: removed `fragmentPoolSize` (now per chapter), added Backfire/timer rules per GDD v2.0, Oath cap, loot options, fallback table.
+- `Chapter` → `ChapterDefinition` with explicit `ChapterRules` (max fragments, pool sizes, Shrouded share, temp-buff pool).
+- `Actor` → `EnemyDefinition`; moves show exact damage (no ranges), added `heavy`, dialogue keys renamed (`onDefeat`/`onVictory`).
+- `FragmentPool` → `FragmentTable` with separate `shroudedEntries`; Shrouded variants are separate fragments.
+- `AspectFragment.tempBuffOnCast` → `mysteryMarkers` count; the temp-buff pool moved to `ChapterRules`.
+- `GameBuff` + generic `Modifier` → `StatusDefinition` with a closed `StatusEffect` union, `kind`, `family`, `level`; debuffs and temp buffs share it.
+- Save state tracks `heldStatusCodes` (one per family), `playedEncounterCodes`, `shownHintCodes`.
+- Battle state: instance ids for pool fragments and statuses, deadline-based timer, `CastResult`, PRNG state, `resolve_fizzle` phase; removed `revealedHiddenIndices` (all letters reveal at Bind).
